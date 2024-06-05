@@ -1888,8 +1888,165 @@ class FunctionaryChatHandler(ABC):
             usage=completion["usage"],
         )
     
-    def generate_streaming(self):
-        pass
+    def generate_streaming(self, prompt: str, tool_func_choice: Optional[Union[str, Dict]]):
+        
+        def yield_response(id, created, model, finish_reason, logprobs, delta):
+            return llama_types.CreateChatCompletionStreamResponse(
+                id="chat" + id,
+                object="chat.completion.chunk",
+                created=created,
+                model=model,
+                choices=[
+                    {
+                        "index": 0,
+                        "finish_reason": finish_reason,
+                        "logprobs": logprobs,
+                        "delta": delta
+                    }
+                ],
+            )
+        
+        chunk_id, chunk_created = None, None
+        delta = {"role": None, "content": None, "function_call": None, "tool_calls": None}
+        
+        # If tool_choice/function_call is provided
+        if isinstance(tool_func_choice, dict):
+            prompt, stops, grammar = self.prepare_for_generation_with_tool_func_choice(
+                prompt=prompt, tool_name=tool_func_choice["name"]
+            )
+            tool_id = "".join([random.choice(string.ascii_letters + string.digits) for _ in range(24)])
+            completion = self.create_completion(prompt=prompt, stop=stops, grammar=grammar)
+
+            for idx, chunk in enumerate(completion):
+                if idx == 0:
+                    # Yield the tool/function name first
+                    func_call_dict = {"name": tool_func_choice["name"], "arguments": ""}
+                    delta.update({"role": None, "content": None})
+                    if self.tools is not None:
+                        delta.update(
+                            {
+                                "function_call": None,
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_" + tool_id,
+                                        "type": "function",
+                                        "function": func_call_dict,
+                                    }
+                                ]
+                            }
+                        )
+                    else:
+                        delta.update({"function_call": func_call_dict, "tool_calls": None})
+                    yield yield_response(
+                        chunk["id"], chunk["created"], chunk["model"], None, None, delta
+                    )
+                
+                # Iterate through the completion
+                func_call_dict = {"name": None, "arguments": chunk["choices"][0]["text"].rstrip()}
+                if self.tools is not None:
+                    delta.update(
+                            {
+                                "function_call": None,
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_" + tool_id,
+                                        "type": "function",
+                                        "function": func_call_dict,
+                                    }
+                                ]
+                            }
+                        )
+                else:
+                    delta.update({"function_call": func_call_dict, "tool_calls": None})
+                logprobs = chunk["choices"][0]["logprobs"]
+                if len(chunk["choices"][0]["text"].rstrip()) > 0:
+                    yield yield_response(
+                        chunk["id"], chunk["created"], chunk["model"], None, logprobs, delta
+                    )
+
+            # Yield tool_call/function_call stop message
+            finish_reason = "tool_calls" if self.tools is not None else "function_call"
+            delta.update({"function_call": None, "tool_calls": None})
+            yield yield_response(
+                chunk["id"], chunk["created"], chunk["model"], finish_reason, None, delta
+            )
+        # If "auto" or no tool_choice/function_call
+        elif isinstance(tool_func_choice, str) and tool_func_choice == "auto":
+            tool_index = -1
+            to_break = False
+            while True:
+                # Determine whether to generate content or tool call or stop
+                delta_texts, prompt, response_type = self.generate_streaming_to_determine_text_or_tool_call(
+                        prompt=prompt, tool_func_choice=tool_func_choice
+                )
+                
+                # If stop
+                if response_type == "stop":
+                    break
+                # Generate content
+                if response_type == "content":
+                    generator = self.generate_streaming_content(prompt=prompt)
+                # Generate tool call
+                else:
+                    generator = self.generate_streaming_tool_call(prompt=prompt)
+                    tool_id = "".join([random.choice(string.ascii_letters + string.digits) for _ in range(24)])
+                
+                for response, finish_reason, logprobs, chunk, prompt in generator:
+                    if chunk_id is None:
+                        chunk_id = chunk["id"]
+                    if chunk_created is None:
+                        chunk_created = chunk["created"]
+
+                    if isinstance(response, dict):
+                        if response["name"]:
+                            tool_index += 1
+                        if not self.tools and tool_index == 2:
+                            to_break = True
+                            break
+                        delta.update({"role": None, "content": None})
+                        if self.tools is not None:
+                            delta.update(
+                                    {
+                                        "function_call": None,
+                                        "tool_calls": [
+                                            {
+                                                "index": tool_index,
+                                                "id": "call_" + tool_id,
+                                                "type": "function",
+                                                "function": response,
+                                            }
+                                        ]
+                                    }
+                                )
+                        else:
+                            delta.update({"function_call": response, "tool_calls": None})
+                        yield yield_response(
+                            chunk_id, chunk_created, chunk["model"], finish_reason, logprobs, delta
+                        )
+                        final_finish_reason = "tool_calls" if self.tools is not None else "function_call"
+                    else:
+                        delta.update({"role": None, "function_call": None, "tool_calls": None})
+                        # Yield the tokens in delta_texts first
+                        for delta_text in delta_texts:
+                            delta.update({"content": delta_text})
+                            yield yield_response(
+                                chunk_id, chunk_created, chunk["model"], finish_reason, logprobs, delta
+                            )
+                        delta_texts = []
+                        delta.update({"content": response})
+                        yield yield_response(
+                            chunk_id, chunk_created, chunk["model"], finish_reason, logprobs, delta
+                        )
+                        final_finish_reason = "stop"
+                if to_break:
+                    break
+            # Yield final finish_reason message
+            delta = {"role": None, "content": None, "function_call": None, "tool_calls": None}
+            yield yield_response(
+                chunk_id, chunk_created, chunk["model"], final_finish_reason, None, delta
+            )
 
     def get_force_text_gen_prefix(self):
         return ""
@@ -1912,6 +2069,20 @@ class FunctionaryChatHandler(ABC):
     def generate_tool_call(self, prompt: str, completion_tokens: int):
         raise NotImplementedError
     
+    @abstractmethod
+    def generate_streaming_to_determine_text_or_tool_call(
+        self, prompt: str, tool_func_choice: Optional[Union[str, Dict]]
+    ):
+        raise NotImplementedError
+    
+    @abstractmethod
+    def generate_streaming_content(self, prompt: str):
+        raise NotImplementedError
+    
+    @abstractmethod
+    def generate_streaming_tool_call(self, prompt: str):
+        raise NotImplementedError
+    
 class FunctionaryV1ChatHandler(FunctionaryChatHandler):
     stop_token = "<|END_OF_ASSISTANT|>"
     tool_call_token = "<|START_OF_FUNCTION_CALL|>"
@@ -1921,7 +2092,7 @@ class FunctionaryV1ChatHandler(FunctionaryChatHandler):
         # Directly add the tool_name into the prompt
         prompt += f"{self.tool_call_token}{tool_name}:\n"
         stops = [self.tool_call_stop_token]
-        grammar = self.get_grammar(tool_name)
+        grammar = None  # Grammar does not work well with v1.4 when streaming
         
         return prompt, stops, grammar
     
@@ -1946,7 +2117,7 @@ class FunctionaryV1ChatHandler(FunctionaryChatHandler):
         else:
             return prompt, completion_tokens, "content"
         
-    def generate_content(self, prompt: str, content: str, completion_tokens: int):
+    def generate_content(self, prompt: str, content: str, completion_tokens):
         stops = [self.tool_call_token, self.stop_token]
         completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
         completion_text = completion["choices"][0]["text"]
@@ -1956,7 +2127,7 @@ class FunctionaryV1ChatHandler(FunctionaryChatHandler):
         
         return content, prompt, completion_tokens, completion
         
-    def generate_tool_call(self, prompt: str, completion_tokens: int):
+    def generate_tool_call(self, prompt: str, completion_tokens):
         # Generate function name
         stops = [":\n", "\n\n"]
         completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
@@ -1973,6 +2144,60 @@ class FunctionaryV1ChatHandler(FunctionaryChatHandler):
         prompt += function_args
 
         return function_name, function_args, prompt, completion_tokens, completion
+    
+    def generate_streaming_to_determine_text_or_tool_call(
+        self, prompt: str, tool_func_choice: Optional[Union[str, Dict]]
+    ):
+        # Generate 1 token first to determine text or tool call or stop
+        stops = []
+        grammar = None
+        completion = self.create_completion(
+            prompt=prompt, stop=stops, grammar=grammar, max_tokens=1
+        )
+        for chunk in completion:
+            if chunk["choices"][0]["text"]:
+                delta_text = chunk["choices"][0]["text"].strip()
+        
+        if delta_text == self.tool_call_token:
+            prompt += delta_text
+            return [], prompt, "tool_call"
+        elif delta_text in [self.tool_call_stop_token, self.stop_token]:
+            return [], prompt, "stop"
+        else:
+            prompt += delta_text
+            return [delta_text], prompt, "content"
+        
+    def generate_streaming_content(self, prompt: str):
+        stops = [self.tool_call_token, self.stop_token]
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
+        for chunk in completion:
+            delta_text = chunk["choices"][0]["text"]
+            if delta_text:
+                prompt += delta_text
+                finish_reason = chunk["choices"][0]["finish_reason"]
+                logprobs = chunk["choices"][0]["logprobs"]
+                yield delta_text, finish_reason, logprobs, chunk, prompt
+    
+    def generate_streaming_tool_call(self, prompt: str):
+        # Generate function name
+        stops = [":\n", "\n\n"]
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
+        function_name = ""
+        for chunk in completion:
+            if chunk["choices"][0]["text"]:
+                function_name += chunk["choices"][0]["text"]
+        function_name = function_name.strip()
+        prompt += function_name + ":\n"
+        yield {"name": function_name, "arguments": ""}, None, None, chunk, prompt
+        # Generate function args
+        stops = [self.tool_call_stop_token]
+        grammar = None  # Use None first for easier control
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=grammar)
+        for chunk in completion:
+            delta_text = chunk["choices"][0]["text"]
+            if delta_text:
+                prompt += delta_text
+                yield {"name": None, "arguments": delta_text}, None, None, chunk, prompt
 
 
 class FunctionaryV2ChatHandler(FunctionaryChatHandler):
@@ -1987,7 +2212,7 @@ class FunctionaryV2ChatHandler(FunctionaryChatHandler):
     def prepare_for_generation_with_tool_func_choice(self, prompt: str, tool_name: str):
         # Directly add the tool_name into the prompt
         prompt += f"{tool_name}\n{self.content_token}"
-        stops = [self.stop_token, f"\n{self.from_token}"]
+        stops = [self.stop_token, f"\n{self.from_token}", "\n\n\n\n"]
         grammar = self.get_grammar(tool_name)
         
         return prompt, stops, grammar
@@ -2002,6 +2227,8 @@ class FunctionaryV2ChatHandler(FunctionaryChatHandler):
             completion_text = completion["choices"][0]["text"]
             if completion_text == self.stop_token:
                 return prompt, completion_tokens, "stop"
+            else:
+                prompt += f"\n{self.from_token}assistant\n{self.recipient_token}"
 
         # Generate the recipient first
         stops = [self.content_token]
@@ -2012,14 +2239,14 @@ class FunctionaryV2ChatHandler(FunctionaryChatHandler):
             recipient = completion_text[completion_text.rindex(self.recipient_token) + len(self.recipient_token):].strip()
         else:
             recipient = completion_text.strip()
-        prompt += f"{completion_text}{self.content_token}"
+        prompt += f"{recipient}\n{self.content_token}"
         
         if recipient == "all":
             return prompt, completion_tokens, "content"
         else:
             return prompt, completion_tokens, "tool_call"
         
-    def generate_content(self, prompt: str, content: str, completion_tokens: int):
+    def generate_content(self, prompt: str, content: str, completion_tokens):
         stops = [self.stop_token, f"\n{self.from_token}"]
         completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
         completion_text = completion["choices"][0]["text"]
@@ -2034,14 +2261,73 @@ class FunctionaryV2ChatHandler(FunctionaryChatHandler):
         # Extract function name
         function_name = prompt[prompt.rindex(self.recipient_token) + len(self.recipient_token): prompt.rindex(self.content_token)].strip()
         # Generate function args
-        stops = [self.stop_token, f"\n{self.from_token}", "\n\n"]
-        grammar = self.get_grammar(function_name)
+        stops = [self.stop_token, f"\n{self.from_token}", "\n\n\n"]
+        grammar = self.get_grammar(function_name) if function_name != "python" else None
         completion = self.create_completion(prompt=prompt, stop=stops, grammar=grammar)
         function_args = completion["choices"][0]["text"].strip()
         completion_tokens += completion["usage"]["completion_tokens"]
         prompt += function_args
 
         return function_name, function_args, prompt, completion_tokens, completion
+    
+    def generate_streaming_to_determine_text_or_tool_call(
+        self, prompt: str, tool_func_choice: Optional[Union[str, Dict]]
+    ):
+        # If prompt does not end with recipient token, check if stop is reached
+        # Else, extend prompt until recipient token
+        if not prompt.endswith(self.recipient_token):
+            # Generate 1 token to check if it is stop token
+            completion = self.create_completion(prompt=prompt, stop=[], grammar=None, max_tokens=1)
+            for chunk in completion:
+                if chunk["choices"][0]["text"]:
+                    delta_text = chunk["choices"][0]["text"]
+            if delta_text == self.stop_token:
+                return [], prompt, "stop"
+            else:
+                prompt += f"\n{self.from_token}assistant\n{self.recipient_token}"
+
+        # Generate 1 token to check if it is "all" (content) or function name (tool_call)
+        completion = self.create_completion(prompt=prompt, stop=[], grammar=None, max_tokens=1)
+        for chunk in completion:
+            if chunk["choices"][0]["text"]:
+                delta_text = chunk["choices"][0]["text"]
+
+        if delta_text.strip() == "all":
+            prompt += f"all\n{self.content_token}"
+            return [], prompt, "content"
+        else:
+            return [], prompt, "tool_call"
+
+    def generate_streaming_content(self, prompt: str):
+        stops = [self.stop_token, f"\n{self.from_token}"]
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
+        for chunk in completion:
+            delta_text = chunk["choices"][0]["text"]
+            if delta_text:
+                prompt += delta_text
+                finish_reason = chunk["choices"][0]["finish_reason"]
+                logprobs = chunk["choices"][0]["logprobs"]
+                yield delta_text, finish_reason, logprobs, chunk, prompt
+    
+    def generate_streaming_tool_call(self, prompt: str):
+        # Generate function name
+        function_name = ""
+        stops = ["\n"]  # "{self.recipient_token}{func_name}\n{self.content_token}"
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
+        for chunk in completion:
+            function_name += chunk["choices"][0]["text"]
+        function_name = function_name.strip()
+        prompt += function_name + f"\n{self.content_token}"
+        yield {"name": function_name, "arguments": ""}, None, None, chunk, prompt
+        # Generate function args
+        stops = [self.stop_token, f"\n{self.from_token}", "\n\n\n"]
+        grammar = self.get_grammar(function_name) if function_name != "python" else None
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=grammar)
+        for chunk in completion:
+            delta_text = chunk["choices"][0]["text"]
+            if delta_text:
+                prompt += delta_text
+                yield {"name": None, "arguments": delta_text}, None, None, chunk, prompt
 
 class FunctionaryV25ChatHandler(FunctionaryChatHandler):
     tool_call_token = "<|reserved_special_token_249|>"
@@ -2077,10 +2363,7 @@ class FunctionaryV25ChatHandler(FunctionaryChatHandler):
         
     def generate_content(self, prompt: str, content: str, completion_tokens: int):
         stops = [self.tool_call_token, self.stop_token]
-        logger.info("generate content")
-        print(len(prompt))
         completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
-        logger.info("generate content completion")
         completion_text = completion["choices"][0]["text"]
         completion_tokens += completion["usage"]["completion_tokens"]
         prompt += completion_text
@@ -2098,13 +2381,70 @@ class FunctionaryV25ChatHandler(FunctionaryChatHandler):
         prompt += completion_text + "\n"
         # Generate function args
         stops = [self.tool_call_token, self.stop_token]
-        grammar = self.get_grammar(function_name)
+        grammar = self.get_grammar(function_name) if function_name != "python" else None
         completion = self.create_completion(prompt=prompt, stop=stops, grammar=grammar)
         function_args = completion["choices"][0]["text"]
         completion_tokens += completion["usage"]["completion_tokens"]
         prompt += function_args
 
         return function_name, function_args, prompt, completion_tokens, completion
+    
+    def generate_streaming_to_determine_text_or_tool_call(
+        self, prompt: str, tool_func_choice: Optional[Union[str, Dict]]
+    ):
+        delta_texts = []
+        completion_text = ""
+        # Generate 1 token first to determine text or tool call
+        stops = []
+        grammar = None
+        completion = self.create_completion(
+            prompt=prompt, stop=stops, grammar=grammar, max_tokens=1
+        )
+        for chunk in completion:
+            delta_text = chunk["choices"][0]["text"]
+            if delta_text:
+                delta_texts.append(delta_text)
+                completion_text += delta_text
+        
+        prompt += completion_text
+        
+        if completion_text.strip() == self.tool_call_token:
+            return delta_texts, prompt, "tool_call"
+        elif len(completion_text) == 0:
+            return delta_texts, prompt, "stop"
+        else:
+            return delta_texts, prompt, "content"
+        
+    def generate_streaming_content(self, prompt: str):
+        stops = [self.tool_call_token, self.stop_token]
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
+        for chunk in completion:
+            delta_text = chunk["choices"][0]["text"]
+            if delta_text:
+                prompt += delta_text
+                finish_reason = chunk["choices"][0]["finish_reason"]
+                logprobs = chunk["choices"][0]["logprobs"]
+                yield delta_text, finish_reason, logprobs, chunk, prompt
+    
+    def generate_streaming_tool_call(self, prompt: str):
+        # Generate function name
+        function_name = ""
+        stops = ["\n"]  # "{self.tool_call_token}{func_name}\n"
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=None)
+        for chunk in completion:
+            function_name += chunk["choices"][0]["text"]
+        prompt += function_name + "\n"
+        yield {"name": function_name, "arguments": ""}, None, None, chunk, prompt
+        # Generate function args
+        stops = [self.tool_call_token, self.stop_token]
+        grammar = self.get_grammar(function_name) if function_name != "python" else None
+        completion = self.create_completion(prompt=prompt, stop=stops, grammar=grammar)
+        for chunk in completion:
+            delta_text = chunk["choices"][0]["text"]
+            if delta_text:
+                prompt += delta_text
+                yield {"name": None, "arguments": delta_text}, None, None, chunk, prompt
+
 
 
 @register_chat_completion_handler("functionary")
@@ -2311,6 +2651,9 @@ def functionary_new_chat_handler(
     # If no tools/functions are provided
     if tool_func_choice == "none" or (tools is None or len(tools) == 0) and (functions is None or len(functions) == 0):
         return handler.generate_text_only(prompt=prompt)
+
+    if stream is not False:
+        return handler.generate_streaming(prompt=prompt, tool_func_choice=tool_func_choice)
     else:
         return handler.generate(prompt=prompt, tool_func_choice=tool_func_choice)
 
